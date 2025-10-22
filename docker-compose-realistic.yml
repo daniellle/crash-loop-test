@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: 'postgres:9.6-alpine'
+    environment:
+      PGDATA: '/var/lib/postgresql/data/pgdata'
+      POSTGRES_USER: 'postgres'
+      POSTGRES_PASSWORD: 'postgres'
+      POSTGRES_DB: 'shipyard'
+    volumes:
+      - 'test-postgres:/var/lib/postgresql/data/pgdata'
+    ports:
+      - '5432'
+
+  redis:
+    image: 'redis:4-alpine'
+    ports:
+      - '6379'
+
+  # Simulates the heartbeat service that runs migrations
+  heartbeat:
+    image: python:3.10-slim
+    labels:
+      # This will try to add the jfrog column but fail (simulating incomplete migration)
+      shipyard.init: 'echo "Running migration..." && echo "Migration partially completed" && exit 0'
+    depends_on:
+      - redis
+      - postgres
+    command: |
+      sh -c "echo 'Heartbeat running...' && sleep 1000"
+
+  # This mimics your web service - it will crash because jfrog_api_key doesn't exist
+  web:
+    build: .
+    labels:
+      shipyard.route: '/'
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '15'
+      shipyard.liveness.period: '15'
+      shipyard.readiness.http.path: '/health'
+      shipyard.readiness.initial_delay: '10'
+      shipyard.readiness.period: '15'
+    depends_on:
+      - redis
+      - postgres
+      - heartbeat
+    ports:
+      - '8080'
+    restart: always
+    environment:
+      DATABASE_URL: 'postgresql://postgres:postgres@postgres:5432/shipyard'
+
+  # Worker that also depends on the database with the missing column
+  worker:
+    build: .
+    depends_on:
+      - web
+    restart: always
+    command: |
+      sh -c "sleep 5 && echo 'Worker starting...' && python app.py"
+
+volumes:
+  test-postgres:

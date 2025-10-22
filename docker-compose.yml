@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  # Service that crashes immediately - simulates your web service with missing column
+  web-crash:
+    image: python:3.10-slim
+    labels:
+      shipyard.route: '/'
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '5'
+      shipyard.liveness.period: '10'
+      shipyard.readiness.http.path: '/health'
+      shipyard.readiness.initial_delay: '5'
+      shipyard.readiness.period: '10'
+    command: |
+      sh -c "echo 'ERROR: column org.jfrog_api_key does not exist' && exit 1"
+    ports:
+      - '8080'
+    restart: always
+
+  # Service that crashes after a few seconds
+  delayed-crash:
+    image: python:3.10-slim
+    command: |
+      sh -c "sleep 3 && echo 'psycopg2.errors.UndefinedColumn: column does not exist' && exit 1"
+    ports:
+      - '8081'
+    restart: always
+
+  # Service that simulates database migration failure
+  postgres-migration-fail:
+    image: postgres:9.6-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    ports:
+      - '5432'
+
+  # Service that depends on postgres but fails to connect
+  api-with-db-error:
+    image: python:3.10-slim
+    depends_on:
+      - postgres-migration-fail
+    command: |
+      python -c "
+      import sys
+      print('Starting API service...')
+      print('Connecting to database...')
+      print('ERROR: column org.jfrog_api_key does not exist at character 2670')
+      print('psycopg2.errors.UndefinedColumn: column org.jfrog_api_key does not exist')
+      sys.exit(1)
+      "
+    ports:
+      - '8082'
+    restart: always
+
+  # Service with init container that fails
+  init-fail-service:
+    image: python:3.10-slim
+    labels:
+      shipyard.init: 'python -c "import sys; print(\"Migration failed\"); sys.exit(1)"'
+    command: |
+      sh -c "echo 'This should never run because init failed' && sleep 1000"
+    ports:
+      - '8083'
+
+  # Service that's actually healthy (for comparison)
+  healthy-service:
+    image: python:3.10-slim
+    command: |
+      python -c "
+      import http.server
+      import socketserver
+      PORT = 8080
+      Handler = http.server.SimpleHTTPRequestHandler
+      with socketserver.TCPServer(('', PORT), Handler) as httpd:
+          print(f'Serving on port {PORT}')
+          httpd.serve_forever()
+      "
+    ports:
+      - '8084:8080'
+    labels:
+      shipyard.liveness.http.path: '/'
+      shipyard.liveness.initial_delay: '5'
+      shipyard.readiness.http.path: '/'
+      shipyard.readiness.initial_delay: '5'
