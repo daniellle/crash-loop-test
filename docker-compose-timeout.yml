@@ -92,6 +92,7 @@ services:
       shipyard.liveness.initial_delay: '10'
       shipyard.liveness.period: '5'
       shipyard.liveness.timeout: '2'
+      shipyard.route: '/'
     command: |
       bash -c "
       pip install flask -q
