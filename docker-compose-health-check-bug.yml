@@ -1,0 +1,213 @@
+version: '3.8'
+
+# This compose file reproduces the bug where:
+# 1. Service starts successfully (creates ROUTINE log with successful=true)
+# 2. Health check fails later (creates HEALTH_CHECK_FAILED log with successful=false)
+# 3. But API returns the old ROUTINE log instead of HEALTH_CHECK_FAILED log
+
+services:
+  postgres:
+    image: 'postgres:9.6-alpine'
+    environment:
+      PGDATA: '/var/lib/postgresql/data/pgdata'
+      POSTGRES_USER: 'postgres'
+      POSTGRES_PASSWORD: 'postgres'
+      POSTGRES_DB: 'testdb'
+    volumes:
+      - 'test-postgres-health:/var/lib/postgresql/data/pgdata'
+    ports:
+      - '5432'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Simulates heartbeat service that runs migrations
+  # This will FAIL the migration after postgres is ready
+  heartbeat:
+    image: postgres:9.6-alpine
+    labels:
+      # This migration will fail!
+      shipyard.init: |
+        sh -c "
+        echo 'Running database migration...';
+        sleep 2;
+        echo 'ERROR: Migration failed - column jfrog_api_key already exists';
+        echo 'ERROR: ALTER TABLE org ADD COLUMN jfrog_api_key failed';
+        exit 1
+        "
+    depends_on:
+      - postgres
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: testdb
+    command: |
+      sh -c "
+      echo 'Heartbeat service starting...';
+      echo 'Waiting for postgres...';
+      until pg_isready -h postgres -U postgres; do
+        echo 'Postgres not ready, waiting...';
+        sleep 1;
+      done;
+      echo 'Postgres is ready!';
+      echo 'Heartbeat running celery beat...';
+      sleep infinity;
+      "
+
+  # Web service that depends on heartbeat (which fails migration)
+  # This will START successfully, then FAIL health checks
+  web:
+    image: python:3.10-slim
+    labels:
+      shipyard.route: '/'
+      # Health check on /health endpoint
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '15'
+      shipyard.liveness.period: '10'
+      shipyard.liveness.timeout_seconds: '5'
+      shipyard.readiness.http.path: '/health'
+      shipyard.readiness.initial_delay: '10'
+      shipyard.readiness.period: '10'
+    depends_on:
+      - redis
+      - postgres
+      - heartbeat
+    ports:
+      - '8080'
+    environment:
+      DATABASE_URL: 'postgresql://postgres:postgres@postgres:5432/testdb'
+    command: |
+      bash -c "
+      set -e
+
+      # Install Flask
+      pip install -q flask gunicorn 2>/dev/null || true
+
+      # Create a Flask app that starts successfully but fails health checks
+      cat > /app.py << 'PYEOF'
+import os
+import sys
+import time
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+# Track startup time
+START_TIME = time.time()
+FAIL_AFTER_SECONDS = 30  # Fail health checks after 30 seconds
+
+@app.route('/')
+def index():
+    return 'Web service running'
+
+@app.route('/health')
+def health():
+    uptime = time.time() - START_TIME
+
+    # Simulate: service starts OK, then health checks fail
+    if uptime < FAIL_AFTER_SECONDS:
+        # Service is healthy initially
+        return jsonify({
+            'status': 'healthy',
+            'uptime': uptime,
+            'message': 'Service is starting up...'
+        }), 200
+    else:
+        # After 30 seconds, simulate database connection failure
+        # This mimics what happens when migration fails and web can't query DB
+        print(f'ERROR: column org.jfrog_api_key does not exist at character 2670', file=sys.stderr)
+        print(f'psycopg2.errors.UndefinedColumn: column org.jfrog_api_key does not exist', file=sys.stderr)
+
+        return jsonify({
+            'status': 'unhealthy',
+            'uptime': uptime,
+            'error': 'Database schema mismatch - migration failed',
+            'message': 'column org.jfrog_api_key does not exist'
+        }), 500
+
+if __name__ == '__main__':
+    print('[INFO] Starting web service...')
+    print('[INFO] Service will be healthy for 30 seconds, then fail health checks')
+    print('[INFO] This simulates migration failure scenario')
+    app.run(host='0.0.0.0', port=8080, debug=False)
+PYEOF
+
+      # Start the Flask app
+      echo 'Starting web service...';
+      python /app.py
+      "
+
+  # API service with similar behavior - starts OK, fails later
+  api:
+    image: python:3.10-slim
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '15'
+      shipyard.liveness.period: '10'
+      shipyard.readiness.http.path: '/health'
+      shipyard.readiness.initial_delay: '10'
+      shipyard.readiness.period: '10'
+    depends_on:
+      - postgres
+      - heartbeat
+    ports:
+      - '8081'
+    command: |
+      bash -c "
+      pip install -q flask 2>/dev/null || true
+
+      cat > /app.py << 'PYEOF'
+import sys
+import time
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+START_TIME = time.time()
+FAIL_AFTER_SECONDS = 25
+
+@app.route('/')
+def index():
+    return 'API service running'
+
+@app.route('/health')
+def health():
+    uptime = time.time() - START_TIME
+
+    if uptime < FAIL_AFTER_SECONDS:
+        return jsonify({'status': 'healthy'}), 200
+    else:
+        print('ERROR: Health check timeout', file=sys.stderr)
+        print('ERROR: Database connection failed', file=sys.stderr)
+        return jsonify({
+            'status': 'unhealthy',
+            'error': 'health check timeout'
+        }), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+PYEOF
+
+      python /app.py
+      "
+
+  redis:
+    image: 'redis:4-alpine'
+    ports:
+      - '6379'
+
+  # Service that immediately fails (for comparison)
+  immediate-fail:
+    image: python:3.10-slim
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '5'
+      shipyard.liveness.period: '5'
+    command: |
+      sh -c "echo 'Service starting...'; sleep 2; echo 'Immediate failure!'; exit 1"
+    restart: always
+
+volumes:
+  test-postgres-health:
