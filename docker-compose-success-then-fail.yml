@@ -1,0 +1,173 @@
+version: '3.8'
+
+# This docker-compose reproduces the exact bug scenario:
+# 1. Service starts and responds to health checks successfully → ROUTINE log (successful=true)
+# 2. After deployment succeeds, health checks start timing out → HEALTH_CHECK_FAILED log (successful=false)
+# 3. API returns the old ROUTINE log instead of HEALTH_CHECK_FAILED → BUG!
+
+services:
+  # This service will:
+  # 1. Start Flask on port 5000
+  # 2. Respond quickly to /health for the first 60 seconds
+  # 3. After 60 seconds, take 10 seconds to respond (health check timeout is 2s)
+  # This ensures the service passes initial health checks, then fails later
+  delayed-timeout:
+    image: python:3.10-slim
+    ports:
+      - "5000"
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '5'     # Start checking after 5s
+      shipyard.liveness.period: '10'           # Check every 10s
+      shipyard.liveness.timeout: '2'           # Timeout if response takes > 2s
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      import time
+      import sys
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+      START_TIME = time.time()
+
+      # Service will be healthy for 60 seconds, then timeout
+      HEALTHY_DURATION_SECONDS = 60
+
+      @app.route('/health')
+      def health():
+          uptime = time.time() - START_TIME
+
+          if uptime < HEALTHY_DURATION_SECONDS:
+              # First 60 seconds: Respond immediately (healthy)
+              print(f'[{uptime:.1f}s] Health check: HEALTHY (responding quickly)', file=sys.stderr, flush=True)
+              return jsonify({
+                  'status': 'healthy',
+                  'uptime_seconds': uptime,
+                  'phase': 'healthy'
+              }), 200
+          else:
+              # After 60 seconds: Sleep for 10s before responding
+              # This will cause health check timeout (timeout is 2s)
+              print(f'[{uptime:.1f}s] Health check: TIMEOUT - sleeping 10s (timeout is 2s)', file=sys.stderr, flush=True)
+              time.sleep(10)
+              return jsonify({
+                  'status': 'timeout',
+                  'uptime_seconds': uptime,
+                  'phase': 'timeout'
+              }), 200
+
+      @app.route('/')
+      def index():
+          uptime = time.time() - START_TIME
+          return jsonify({
+              'message': 'Service is running',
+              'uptime_seconds': uptime
+          })
+
+      if __name__ == '__main__':
+          print('=' * 60, file=sys.stderr, flush=True)
+          print('Starting delayed-timeout service', file=sys.stderr, flush=True)
+          print(f'Will be HEALTHY for {HEALTHY_DURATION_SECONDS} seconds', file=sys.stderr, flush=True)
+          print(f'Then will TIMEOUT (sleep 10s, timeout is 2s)', file=sys.stderr, flush=True)
+          print('=' * 60, file=sys.stderr, flush=True)
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+      python /app.py
+      "
+
+  # Alternative approach: Service that stops listening after initial success
+  # This simulates a service that crashes/hangs after passing initial health checks
+  port-closer:
+    image: python:3.10-slim
+    ports:
+      - "5000"
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '5'
+      shipyard.liveness.period: '10'
+      shipyard.liveness.timeout: '2'
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      import time
+      import sys
+      import signal
+      import threading
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+      START_TIME = time.time()
+      server_running = True
+
+      # Kill the server after 60 seconds
+      KILL_AFTER_SECONDS = 60
+
+      @app.route('/health')
+      def health():
+          uptime = time.time() - START_TIME
+          print(f'[{uptime:.1f}s] Health check received', file=sys.stderr, flush=True)
+          return jsonify({'status': 'healthy'}), 200
+
+      @app.route('/')
+      def index():
+          return jsonify({'message': 'Running'})
+
+      def kill_server():
+          time.sleep(KILL_AFTER_SECONDS)
+          print('=' * 60, file=sys.stderr, flush=True)
+          print(f'[{KILL_AFTER_SECONDS}s] KILLING SERVER - health checks will now timeout', file=sys.stderr, flush=True)
+          print('=' * 60, file=sys.stderr, flush=True)
+          # Exit the process - this will cause connection timeouts
+          sys.exit(1)
+
+      if __name__ == '__main__':
+          print('=' * 60, file=sys.stderr, flush=True)
+          print('Starting port-closer service', file=sys.stderr, flush=True)
+          print(f'Will EXIT after {KILL_AFTER_SECONDS} seconds', file=sys.stderr, flush=True)
+          print('=' * 60, file=sys.stderr, flush=True)
+
+          # Start killer thread
+          killer = threading.Thread(target=kill_server, daemon=True)
+          killer.start()
+
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+      python /app.py
+      "
+
+  # Control: Always healthy
+  always-healthy:
+    image: python:3.10-slim
+    ports:
+      - "5000"
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '5'
+      shipyard.liveness.period: '10'
+      shipyard.liveness.timeout: '2'
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      import sys
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+
+      @app.route('/health')
+      def health():
+          print('Health check: HEALTHY', file=sys.stderr, flush=True)
+          return jsonify({'status': 'healthy'}), 200
+
+      @app.route('/')
+      def index():
+          return jsonify({'message': 'Always healthy'})
+
+      if __name__ == '__main__':
+          print('Starting always-healthy service', file=sys.stderr, flush=True)
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+      python /app.py
+      "
