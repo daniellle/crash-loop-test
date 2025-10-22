@@ -1,0 +1,116 @@
+version: '3.8'
+
+# This docker-compose file reproduces the bug where:
+# 1. Service starts successfully and creates a ROUTINE log
+# 2. Health check times out (takes too long to respond)
+# 3. Nautilus sends "health check timeout" message
+# 4. Python creates HEALTH_CHECK_FAILED log
+# 5. BUT the API returns the old ROUTINE log instead of HEALTH_CHECK_FAILED
+
+services:
+  # Service that starts successfully, then health check times out
+  slow-health-check:
+    image: python:3.10-slim
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '10'    # Wait 10s before first check
+      shipyard.liveness.period: '5'            # Check every 5s
+      shipyard.liveness.timeout: '2'           # Timeout after 2s (THIS IS KEY!)
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      import time
+      import sys
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+
+      START_TIME = time.time()
+      DELAY_AFTER_SECONDS = 30
+
+      @app.route('/health')
+      def health():
+          uptime = time.time() - START_TIME
+
+          if uptime < DELAY_AFTER_SECONDS:
+              # First 30 seconds: respond quickly
+              return jsonify({'status': 'healthy', 'uptime': uptime}), 200
+          else:
+              # After 30 seconds: sleep for 5s before responding
+              # This will cause health check timeout (timeout is 2s)
+              print(f'Health check will timeout - sleeping 5s (timeout is 2s)', file=sys.stderr, flush=True)
+              time.sleep(5)
+              return jsonify({'status': 'timeout', 'uptime': uptime}), 200
+
+      @app.route('/')
+      def index():
+          return jsonify({'message': 'App is running'})
+
+      if __name__ == '__main__':
+          print('Starting Flask app...', flush=True)
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+      python /app.py
+      "
+
+  # Service that never responds to health checks (port mismatch)
+  unresponsive-health:
+    image: python:3.10-slim
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '10'
+      shipyard.liveness.period: '5'
+      shipyard.liveness.timeout: '2'
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      import time
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+
+      @app.route('/')
+      def index():
+          return jsonify({'message': 'App is running but no /health endpoint'})
+
+      if __name__ == '__main__':
+          print('Starting Flask app on port 5000 (health check expects different port)...', flush=True)
+          # Shipyard will try to hit port 5000, but we'll listen on wrong port
+          # This causes connection timeout
+          app.run(host='0.0.0.0', port=9999, debug=False)
+      PYEOF
+      python /app.py
+      "
+
+  # Control: service that stays healthy
+  healthy-service:
+    image: python:3.10-slim
+    labels:
+      shipyard.liveness.http.path: '/health'
+      shipyard.liveness.initial_delay: '10'
+      shipyard.liveness.period: '5'
+      shipyard.liveness.timeout: '2'
+    command: |
+      bash -c "
+      pip install flask -q
+      cat > /app.py << 'PYEOF'
+      from flask import Flask, jsonify
+
+      app = Flask(__name__)
+
+      @app.route('/health')
+      def health():
+          return jsonify({'status': 'healthy'}), 200
+
+      @app.route('/')
+      def index():
+          return jsonify({'message': 'Always healthy'})
+
+      if __name__ == '__main__':
+          print('Starting healthy Flask app...', flush=True)
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+      python /app.py
+      "
